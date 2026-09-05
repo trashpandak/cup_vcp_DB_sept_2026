@@ -1,0 +1,125 @@
+name: NSE Cup & Handle Daily Scan
+
+on:
+  schedule:
+    # 10:30 UTC = 4:00 PM IST, Monday-Friday (30 min after NSE close)
+    - cron: "0 19 * * 0-4"
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: "Wipe and redownload all historical data"
+        type: boolean
+        default: false
+      refresh_universe:
+        description: "Force-refresh the NSE symbol list"
+        type: boolean
+        default: false
+      debug_symbol:
+        description: "Run verbose diagnosis for a single symbol (e.g. TCS.NS) instead of a full scan"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hours — comfortable margin for first full-refresh run
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore data cache (Parquet files + symbol list + signal DB)
+        id: data-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/daily/
+            data/nse_symbols.json
+            data/nse_symbol_meta.json
+            data/scanner.db
+          key: nse-data-${{ github.run_id }}
+          restore-keys: |
+            nse-data-
+
+      - name: Report cache status
+        run: |
+          if [ "${{ steps.data-cache.outputs.cache-hit }}" == "true" ]; then
+            echo "Exact cache hit — using prior run's data."
+          else
+            echo "No exact cache hit — restored from most recent available cache (or starting fresh on first run)."
+          fi
+          echo "Parquet files present: $(find data/daily -name '*.parquet' 2>/dev/null | wc -l)"
+
+      - name: Run scanner
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          ARGS=""
+          if [ "${{ inputs.full_refresh }}" == "true" ]; then
+            ARGS="$ARGS --full-refresh"
+          fi
+          if [ "${{ inputs.refresh_universe }}" == "true" ]; then
+            ARGS="$ARGS --refresh-universe"
+          fi
+          if [ -n "${{ inputs.debug_symbol }}" ]; then
+            ARGS="$ARGS --debug-symbol ${{ inputs.debug_symbol }}"
+          fi
+          echo "Running: python main.py $ARGS"
+          python main.py $ARGS
+
+      - name: Save data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/daily/
+            data/nse_symbols.json
+            data/nse_symbol_meta.json
+            data/scanner.db
+          key: nse-data-${{ github.run_id }}
+
+      - name: Upload Excel report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cup-handle-report-${{ github.run_number }}
+          path: reports/*.xlsx
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload HTML dashboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cup-handle-dashboard-${{ github.run_number }}
+          path: charts/*.html
+          retention-days: 2
+          if-no-files-found: warn
+
+      - name: Upload logs (for debugging failed runs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-logs-${{ github.run_number }}
+          path: logs/*.log
+          retention-days: 14
+          if-no-files-found: ignore
